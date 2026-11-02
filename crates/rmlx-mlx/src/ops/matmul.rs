@@ -542,6 +542,9 @@ pub fn gather_qmm(
                 gs,
                 bs,
                 mode_cstr.as_ptr(),
+                // mlx-c >= 0.7.x takes global_scale before sorted_indices; absent for the
+                // affine/mxfp modes used here, so pass the cached null sentinel.
+                null_sentinel(),
                 sorted_indices,
                 s,
             )
