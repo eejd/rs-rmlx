@@ -930,3 +930,61 @@ fn an_array_with_no_buffer_has_no_data_address() {
         "an evaluated array with a buffer has an address"
     );
 }
+
+// ── gather_qmm ───────────────────────────────────────────────────────────
+
+/// gather_qmm must match a dense reference built from the dequantized expert
+/// weights (guards the 14-argument mlx-c call incl. global_scale/sorted_indices).
+#[test]
+#[ignore = "needs Metal device (gather_qmm is GPU-only); run with --ignored"]
+fn gather_qmm_matches_dequantized_per_expert_reference() {
+    const E: usize = 3;
+    const OUT: usize = 8;
+    const K: usize = 64;
+    const T: usize = 4;
+    // Deterministic pseudo-random weights and activations.
+    let mut seed = 12345u32;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((seed >> 8) as f32 / 16_777_216.0) - 0.5
+    };
+    let w: Vec<f32> = (0..E * OUT * K).map(|_| rnd()).collect();
+    let x: Vec<f32> = (0..T * K).map(|_| rnd()).collect();
+    let experts = [2i32, 0, 1, 2];
+
+    let w_arr = Array::from_f32_slice(&w, &[E as i32, OUT as i32, K as i32]).unwrap();
+    let (wq, scales, biases) = quantize(&w_arr, 64, 4, Device::Gpu).unwrap();
+    let wdq = dequantize(&wq, &scales, Some(&biases), 64, 4, "affine", Device::Gpu).unwrap();
+    wdq.eval().unwrap();
+    let wdq_f = bytes_to_f32(&wdq.to_bytes().unwrap());
+
+    let x_arr = Array::from_f32_slice(&x, &[T as i32, 1, K as i32]).unwrap();
+    let lhs = Array::from_i32_slice(&[0, 1, 2, 3], &[T as i32]).unwrap();
+    let rhs = Array::from_i32_slice(&experts, &[T as i32]).unwrap();
+    let out = gather_qmm(
+        &x_arr, &wq, &scales, Some(&biases), Some(&lhs), &rhs, 64, 4, "affine", false, Device::Gpu,
+    )
+    .unwrap();
+    out.eval().unwrap();
+    let got = bytes_to_f32(&out.to_bytes().unwrap());
+    assert_eq!(got.len(), T * OUT);
+
+    for t in 0..T {
+        let e = experts[t] as usize;
+        for o in 0..OUT {
+            let mut acc = 0.0f32;
+            for k in 0..K {
+                acc += x[t * K + k] * wdq_f[(e * OUT + o) * K + k];
+            }
+            let g = got[t * OUT + o];
+            assert!((g - acc).abs() < 2e-2, "token {t} out {o}: got {g}, expected {acc}");
+        }
+    }
+    // A different expert must give a different answer (rules out ignoring rhs_indices).
+    let wrong_e = (experts[0] as usize + 1) % E;
+    let mut acc = 0.0f32;
+    for k in 0..K {
+        acc += x[k] * wdq_f[(wrong_e * OUT) * K + k];
+    }
+    assert!((got[0] - acc).abs() > 1e-3, "expert selection had no effect");
+}
